@@ -6,6 +6,11 @@ from app.database import (
     init_db,
     get_database_stats,
     get_public_stats,
+    create_capture_with_detections,
+    approve_capture,
+    reject_capture,
+    correct_detection_class,
+    list_public_captures,
 )
 
 
@@ -322,3 +327,72 @@ def test_database_stats_calculation(temp_db):
     assert public_stats["approved_metal_detections"] == 1
 
     conn.close()
+
+
+def test_stage2_create_capture_with_pending_detections(temp_db):
+    """Verify new captures leave final_class as NULL until admin review."""
+    det_list = [
+        {"ai_class": "dry", "ai_confidence": 0.89, "bbox_x": 10, "bbox_y": 20, "bbox_width": 50, "bbox_height": 60},
+        {"ai_class": "metal", "ai_confidence": 0.94, "bbox_x": 80, "bbox_y": 90, "bbox_width": 40, "bbox_height": 45},
+    ]
+    cap_id = create_capture_with_detections(
+        image_path="data/images/raw/test1.jpg",
+        prediction_image_path="data/images/predictions/test1.jpg",
+        model_id="waste_models_yolo",
+        detections=det_list,
+        db_path=temp_db,
+    )
+
+    conn = get_connection(temp_db)
+    cap_row = conn.execute("SELECT * FROM captures WHERE id = ?;", (cap_id,)).fetchone()
+    assert cap_row["status"] == "pending"
+
+    det_rows = conn.execute("SELECT * FROM detections WHERE capture_id = ? ORDER BY item_index;", (cap_id,)).fetchall()
+    assert len(det_rows) == 2
+    # Verify final_class is NULL initially
+    assert det_rows[0]["final_class"] is None
+    assert det_rows[1]["final_class"] is None
+    conn.close()
+
+
+def test_stage2_approve_and_reject_workflow(temp_db):
+    """Verify approval populates final_class from ai_class and records audit event."""
+    det_list = [{"ai_class": "metal", "ai_confidence": 0.91, "bbox_x": 0, "bbox_y": 0, "bbox_width": 10, "bbox_height": 10}]
+    cap_id = create_capture_with_detections(
+        image_path="test_app.jpg",
+        prediction_image_path="test_app_p.jpg",
+        model_id="waste_models_yolo",
+        detections=det_list,
+        db_path=temp_db,
+    )
+
+    # Approve
+    approved_cap = approve_capture(cap_id, reviewer="lead_admin", note="Verified by admin", db_path=temp_db)
+    assert approved_cap["status"] == "approved"
+    assert approved_cap["reviewed_by"] == "lead_admin"
+    assert approved_cap["detections"][0]["final_class"] == "metal"
+    assert len(approved_cap["review_events"]) == 1
+    assert approved_cap["review_events"][0]["action"] == "approved"
+
+    # Reject another capture
+    cap2_id = create_capture_with_detections("r.jpg", "r_p.jpg", "waste_models_yolo", db_path=temp_db)
+    rejected_cap = reject_capture(cap2_id, reviewer="lead_admin", note="Empty chute", db_path=temp_db)
+    assert rejected_cap["status"] == "rejected"
+    assert len(rejected_cap["review_events"]) == 1
+    assert rejected_cap["review_events"][0]["action"] == "rejected"
+
+
+def test_stage2_list_public_captures_privacy(temp_db):
+    """Verify list_public_captures only returns approved captures."""
+    # 1 pending, 1 rejected, 1 approved
+    cap_p = create_capture_with_detections("p.jpg", "p.jpg", "model", db_path=temp_db)
+    cap_r = create_capture_with_detections("r.jpg", "r.jpg", "model", db_path=temp_db)
+    reject_capture(cap_r, db_path=temp_db)
+    cap_a = create_capture_with_detections("a.jpg", "a.jpg", "model", db_path=temp_db)
+    approve_capture(cap_a, db_path=temp_db)
+
+    public_items = list_public_captures(db_path=temp_db)
+    assert len(public_items) == 1
+    assert public_items[0]["id"] == cap_a
+    assert public_items[0]["status"] == "approved"
+

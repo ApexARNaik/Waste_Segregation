@@ -28,6 +28,16 @@ htmlcov/
 *.db-shm
 data/*.db
 
+# Model weights and training outputs
+models/
+runs/
+*.pt
+
+# Frontend build & dependencies
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
 # Captured and Predicted Images
 captures/
 data/images/raw/*

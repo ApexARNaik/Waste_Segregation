@@ -190,3 +190,119 @@ def test_public_statistics_never_exposes_pending_or_rejected(client_with_isolate
     assert admin_data["pending_captures"] == 1
     assert admin_data["approved_captures"] == 1
     assert admin_data["rejected_captures"] == 1
+
+
+def test_stage2_admin_dashboard_endpoint(client_with_isolated_db):
+    """GET /api/admin/dashboard returns system overview, camera and model status."""
+    client, _ = client_with_isolated_db
+    login_resp = client.post("/api/admin/login", json={"password": settings.ADMIN_PASSWORD})
+    token = login_resp.json()["access_token"]
+
+    dash_resp = client.get("/api/admin/dashboard", headers={"Authorization": f"Bearer {token}"})
+    assert dash_resp.status_code == 200
+    data = dash_resp.json()
+    assert "total_captures" in data
+    assert "pending_captures" in data
+    assert "approved_captures" in data
+    assert "rejected_captures" in data
+    assert "camera_status" in data
+    assert "model_status" in data
+
+
+def test_stage2_public_and_admin_image_privacy(client_with_isolated_db, tmp_path):
+    """
+    CRITICAL PRIVACY TEST:
+    Public image endpoint MUST return 404 for pending/rejected captures.
+    Admin image endpoint allows authenticated access to raw and prediction images.
+    """
+    client, test_db = client_with_isolated_db
+
+    # Create dummy images in raw and predictions
+    raw_img = settings.RAW_IMAGES_DIR / "dummy_raw.jpg"
+    pred_img = settings.PREDICTIONS_IMAGES_DIR / "dummy_pred.jpg"
+    raw_img.write_bytes(b"DUMMY_RAW_IMAGE_DATA")
+    pred_img.write_bytes(b"DUMMY_PRED_IMAGE_DATA")
+
+    cap_pending = str(uuid.uuid4())
+    cap_approved = str(uuid.uuid4())
+
+    conn = get_connection(test_db)
+    with conn:
+        conn.execute(
+            "INSERT INTO captures (id, image_path, prediction_image_path, captured_at, status) VALUES (?, ?, ?, '2026-11-19T10:00:00Z', 'pending');",
+            (cap_pending, str(raw_img), str(pred_img))
+        )
+        conn.execute(
+            "INSERT INTO captures (id, image_path, prediction_image_path, captured_at, status) VALUES (?, ?, ?, '2026-11-19T10:01:00Z', 'approved');",
+            (cap_approved, str(raw_img), str(pred_img))
+        )
+    conn.close()
+
+    # Public requests
+    # 1. Pending capture image MUST return 404
+    pub_pending_resp = client.get(f"/api/public/images/{cap_pending}")
+    assert pub_pending_resp.status_code == 404
+
+    # 2. Approved capture image returns 200
+    pub_approved_resp = client.get(f"/api/public/images/{cap_approved}")
+    assert pub_approved_resp.status_code == 200
+    assert pub_approved_resp.headers["content-type"] == "image/jpeg"
+
+    # Admin requests
+    login_resp = client.post("/api/admin/login", json={"password": settings.ADMIN_PASSWORD})
+    token = login_resp.json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {token}"}
+
+    # Admin can view raw and prediction for pending captures
+    adm_raw_resp = client.get(f"/api/admin/images/{cap_pending}/raw", headers=admin_headers)
+    assert adm_raw_resp.status_code == 200
+    adm_pred_resp = client.get(f"/api/admin/images/{cap_pending}/prediction", headers=admin_headers)
+    assert adm_pred_resp.status_code == 200
+
+    # Unauthenticated admin image access rejected with 401
+    unauth_img_resp = client.get(f"/api/admin/images/{cap_pending}/raw")
+    assert unauth_img_resp.status_code == 401
+
+
+def test_stage2_admin_review_workflow_and_correction(client_with_isolated_db):
+    """Verify admin approval, rejection, and classification correction endpoints."""
+    client, test_db = client_with_isolated_db
+
+    login_resp = client.post("/api/admin/login", json={"password": settings.ADMIN_PASSWORD})
+    token = login_resp.json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {token}"}
+
+    conn = get_connection(test_db)
+    cap_id = str(uuid.uuid4())
+    det_id = str(uuid.uuid4())
+    with conn:
+        conn.execute("INSERT INTO captures (id, image_path, captured_at, status) VALUES (?, 'img.jpg', '2026-11-19T10:00:00Z', 'pending');", (cap_id,))
+        conn.execute(
+            """
+            INSERT INTO detections (id, capture_id, item_index, ai_class, ai_confidence, final_class, bbox_x, bbox_y, bbox_width, bbox_height)
+            VALUES (?, ?, 0, 'dry', 0.85, NULL, 10, 20, 30, 40);
+            """,
+            (det_id, cap_id)
+        )
+    conn.close()
+
+    # 1. Admin corrects classification to 'metal'
+    patch_resp = client.patch(
+        f"/api/admin/detections/{det_id}",
+        json={"final_class": "metal", "note": "Admin corrected to metal"},
+        headers=admin_headers
+    )
+    assert patch_resp.status_code == 200
+    assert patch_resp.json()["final_class"] == "metal"
+    assert patch_resp.json()["ai_class"] == "dry"  # Preserved!
+
+    # 2. Admin approves capture
+    approve_resp = client.post(
+        f"/api/admin/captures/{cap_id}/approve",
+        json={"admin_note": "Approved by supervisor"},
+        headers=admin_headers
+    )
+    assert approve_resp.status_code == 200
+    assert approve_resp.json()["status"] == "approved"
+    assert approve_resp.json()["reviewed_by"] == "admin"
+

@@ -38,13 +38,37 @@ class Settings:
             self.CAMERA_BAUD = 921600
 
         self.CAMERA_TRIGGER = os.getenv("CAMERA_TRIGGER", "ir").strip()
+        self.IR_SENSOR_PIN = os.getenv("IR_SENSOR_PIN", "UNCONFIRMED_GPIO").strip()
+
         try:
             self.CAPTURE_INTERVAL_SECONDS = int(os.getenv("CAPTURE_INTERVAL_SECONDS", "5"))
         except ValueError:
             self.CAPTURE_INTERVAL_SECONDS = 5
 
+        # Chute cropping coordinates
+        try:
+            self.CROP_LEFT = int(os.getenv("CROP_LEFT", "45"))
+            self.CROP_TOP = int(os.getenv("CROP_TOP", "0"))
+            self.CROP_RIGHT = int(os.getenv("CROP_RIGHT", "610"))
+            self.CROP_BOTTOM = int(os.getenv("CROP_BOTTOM", "480"))
+        except ValueError:
+            self.CROP_LEFT, self.CROP_TOP, self.CROP_RIGHT, self.CROP_BOTTOM = 45, 0, 610, 480
+
+        # Local YOLO Vision configuration
+        raw_model_path = os.getenv("MODEL_PATH", "models/waste_models.pt").strip()
+        self.MODEL_PATH = (BASE_DIR / raw_model_path).resolve() if not Path(raw_model_path).is_absolute() else Path(raw_model_path)
+        try:
+            self.MODEL_CONFIDENCE = float(os.getenv("MODEL_CONFIDENCE", "0.25"))
+        except ValueError:
+            self.MODEL_CONFIDENCE = 0.25
+
         self.RAW_IMAGES_DIR = self.BASE_DIR / "data" / "images" / "raw"
         self.PREDICTIONS_IMAGES_DIR = self.BASE_DIR / "data" / "images" / "predictions"
+        self.FRONTEND_DIST_DIR = self.BASE_DIR / "frontend" / "dist"
+
+    @property
+    def CROP_BOX(self) -> tuple[int, int, int, int]:
+        return (self.CROP_LEFT, self.CROP_TOP, self.CROP_RIGHT, self.CROP_BOTTOM)
 
     def ensure_directories(self) -> None:
         """Create required directories if they do not exist."""
