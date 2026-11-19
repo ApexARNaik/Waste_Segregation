@@ -7,7 +7,6 @@ import {
   XCircle, 
   Clock, 
   RefreshCw, 
-  Lock, 
   LogOut, 
   ExternalLink, 
   Cpu, 
@@ -104,11 +103,6 @@ function PublicDashboard({ navigate }) {
               {health.status === 'healthy' ? 'System Online' : 'System Degraded'}
             </div>
           )}
-
-          <button className="btn btn-secondary" onClick={() => navigate('/admin')}>
-            <Lock size={15} />
-            Admin Portal
-          </button>
         </div>
       </header>
 

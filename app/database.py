@@ -130,10 +130,11 @@ def create_capture_with_detections(
     captured_at: Optional[str] = None,
     source: str = "esp32_cam",
     detections: Optional[List[Dict[str, Any]]] = None,
+    capture_id: Optional[str] = None,
     db_path: Optional[Union[Path, str]] = None,
 ) -> str:
     """Atomically record a new capture and its detections with pending status."""
-    capture_id = str(uuid.uuid4())
+    cid = capture_id if capture_id else str(uuid.uuid4())
     now_iso = captured_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     conn = get_connection(db_path)
@@ -144,7 +145,7 @@ def create_capture_with_detections(
                 INSERT INTO captures (id, image_path, prediction_image_path, source, model_id, captured_at, status)
                 VALUES (?, ?, ?, ?, ?, ?, 'pending');
                 """,
-                (capture_id, image_path, prediction_image_path, source, model_id, now_iso),
+                (cid, image_path, prediction_image_path, source, model_id, now_iso),
             )
 
             if detections:
@@ -160,7 +161,7 @@ def create_capture_with_detections(
                         """,
                         (
                             det_id,
-                            capture_id,
+                            cid,
                             idx,
                             det["ai_class"],
                             float(det["ai_confidence"]),
@@ -171,7 +172,7 @@ def create_capture_with_detections(
                             float(det["bbox_height"]),
                         ),
                     )
-        return capture_id
+        return cid
     finally:
         conn.close()
 

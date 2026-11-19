@@ -115,9 +115,15 @@ class CameraSerialWorker:
 
     def request_manual_capture(self, wait_timeout: float = 10.0) -> Dict[str, Any]:
         """
-        Thread-safe manual capture request.
-        Can be dispatched to physical camera or mock if physical camera is offline.
+        Thread-safe manual capture request to physical ESP32-CAM.
+        Returns a clear error if the camera is disconnected.
         """
+        if self.status != "connected" or self._serial is None or not self._serial.is_open:
+            return {
+                "status": "error",
+                "message": f"Camera on {self.port} is disconnected. Live capture unavailable.",
+            }
+
         completion_event = threading.Event()
         result_holder: Dict[str, Any] = {}
 
@@ -145,6 +151,8 @@ class CameraSerialWorker:
         """
         Crop raw frame to chute box, run local YOLO inference,
         save images, and record pending entry in database.
+        Ensures consistent capture ID across image files, inference, and database.
+        Handles inference failures as errors rather than empty-chute results.
         """
         capture_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -165,7 +173,7 @@ class CameraSerialWorker:
             else:
                 cropped = img
 
-            # Save raw cropped image
+            # Save raw cropped image using capture_id
             raw_dest = settings.RAW_IMAGES_DIR / f"{capture_id}.jpg"
             settings.RAW_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
             cropped.save(raw_dest, format="JPEG", quality=95)
@@ -177,11 +185,26 @@ class CameraSerialWorker:
             confidence_threshold=settings.MODEL_CONFIDENCE,
         )
 
+        # Handle inference failure: must not be represented as an empty chute result
+        if inference_result.get("status") == "error":
+            err_msg = inference_result.get("error", "Vision inference failed")
+            logger.error(f"Inference failure on capture {capture_id}: {err_msg}")
+            self.last_error = f"Inference error: {err_msg}"
+            err_summary = {
+                "status": "error",
+                "message": f"Inference failure: {err_msg}",
+                "capture_id": capture_id,
+                "inference_duration_ms": inference_result.get("inference_duration_ms", 0.0),
+            }
+            self.last_capture_time = now_iso
+            self.last_capture_result = err_summary
+            return err_summary
+
         detections = inference_result.get("detections", [])
         prediction_image_path = inference_result.get("prediction_image_path")
         model_id = inference_result.get("model_id", "waste_models_yolo")
 
-        # Save record in database with status='pending'
+        # Save record in database with identical capture_id and status='pending'
         create_capture_with_detections(
             image_path=str(raw_dest),
             prediction_image_path=str(prediction_image_path) if prediction_image_path else None,
@@ -189,6 +212,7 @@ class CameraSerialWorker:
             captured_at=now_iso,
             source=source,
             detections=detections,
+            capture_id=capture_id,
         )
 
         res_summary = {
@@ -204,51 +228,63 @@ class CameraSerialWorker:
         self.last_capture_result = res_summary
         return res_summary
 
+    def _attempt_connection(self) -> bool:
+        """Attempt serial connection and verify READY response to PING."""
+        try:
+            self._serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baud,
+                timeout=0.25,
+                write_timeout=3.0,
+            )
+            time.sleep(1.5)
+
+            self._serial.reset_input_buffer()
+            self._serial.write(b"PING\n")
+            self._serial.flush()
+            resp = read_line(self._serial, timeout=2.0)
+            if "READY" in resp:
+                self.status = "connected"
+                self.last_error = None
+                logger.info(f"ESP32-CAM connected on {self.port} and ready.")
+                return True
+            else:
+                self.status = "disconnected"
+                self.last_error = f"Camera on {self.port} did not respond with READY to PING (received: '{resp}')."
+                logger.warning(self.last_error)
+                self._close_serial()
+                return False
+        except Exception as exc:
+            self.status = "disconnected"
+            self.last_error = str(exc)
+            self._close_serial()
+            return False
+
     def _worker_loop(self) -> None:
         """Main serial worker polling loop."""
         while not self._stop_event.is_set():
-            # If not connected, attempt connection
+            # If not connected, attempt connection and verify PING/READY
             if self._serial is None or not self._serial.is_open:
-                try:
-                    self._serial = serial.Serial(
-                        port=self.port,
-                        baudrate=self.baud,
-                        timeout=0.25,
-                        write_timeout=3.0,
-                    )
-                    time.sleep(1.5)  # ESP32 reset settling time
+                self._attempt_connection()
 
-                    # Ping camera
-                    self._serial.reset_input_buffer()
-                    self._serial.write(b"PING\n")
-                    self._serial.flush()
-                    resp = read_line(self._serial, timeout=2.0)
-                    if "READY" in resp:
-                        self.status = "connected"
-                        self.last_error = None
-                        logger.info(f"ESP32-CAM connected on {self.port} and ready.")
-                    else:
-                        self.status = "connected"  # Port open even if READY not received
-                except Exception as exc:
-                    self.status = "disconnected"
-                    self.last_error = str(exc)
-                    self._close_serial()
-
-            # If disconnected, check if we need to handle manual requests via fallback/mock
-            if self.status == "disconnected":
+            # If disconnected, decline queued requests with disconnected error without fallback
+            if self.status != "connected":
                 try:
-                    task = self._queue.get(timeout=1.0)
-                    # If hardware disconnected, fallback to sample capture or error response
+                    task = self._queue.get(timeout=0.5)
                     event = task.get("event")
                     result_holder = task.get("result_holder")
                     if task.get("type") == "capture":
-                        res = self._fallback_sample_capture(task.get("source", "manual_fallback"))
+                        err_res = {
+                            "status": "error",
+                            "message": f"Camera on {self.port} is disconnected. Live capture unavailable.",
+                        }
                         if result_holder is not None:
-                            result_holder["response"] = res
+                            result_holder["response"] = err_res
                     if event:
                         event.set()
                 except queue.Empty:
                     pass
+                time.sleep(1.0)
                 continue
 
             # Connected mode: check for queued manual requests or serial incoming messages
@@ -318,27 +354,6 @@ class CameraSerialWorker:
             logger.error(f"Serial capture failed: {exc}")
             self.last_error = str(exc)
             return {"status": "error", "message": str(exc)}
-
-    def _fallback_sample_capture(self, source: str = "manual_fallback") -> Dict[str, Any]:
-        """
-        Graceful fallback when physical hardware is disconnected:
-        Reads one of the preserved local sample captures to test end-to-end pipeline.
-        """
-        sample_candidates = list((settings.BASE_DIR / "captures").glob("*/*.jpg"))
-        if not sample_candidates:
-            return {
-                "status": "error",
-                "message": f"Camera on {self.port} is disconnected and no sample captures exist.",
-            }
-
-        # Pick a sample capture image
-        sample_path = sample_candidates[0]
-        try:
-            with open(sample_path, "rb") as f:
-                payload = f.read()
-            return self.process_image_bytes(payload, source=source)
-        except Exception as exc:
-            return {"status": "error", "message": f"Fallback capture failed: {exc}"}
 
 
 # Global singleton camera worker instance

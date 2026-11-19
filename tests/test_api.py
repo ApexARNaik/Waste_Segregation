@@ -306,3 +306,42 @@ def test_stage2_admin_review_workflow_and_correction(client_with_isolated_db):
     assert approve_resp.json()["status"] == "approved"
     assert approve_resp.json()["reviewed_by"] == "admin"
 
+
+def test_stage21_capture_id_consistency_via_api(client_with_isolated_db):
+    """Verify capture ID consistency across SQLite and API responses."""
+    client, test_db = client_with_isolated_db
+    login_resp = client.post("/api/admin/login", json={"password": settings.ADMIN_PASSWORD})
+    token = login_resp.json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {token}"}
+
+    cid = str(uuid.uuid4())
+    conn = get_connection(test_db)
+    with conn:
+        conn.execute("INSERT INTO captures (id, image_path, captured_at, status) VALUES (?, 'img.jpg', '2026-11-19T10:00:00Z', 'approved');", (cid,))
+    conn.close()
+
+    resp = client.get(f"/api/admin/captures/{cid}", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.json()["id"] == cid
+
+    # Verify public capture response also returns identical id
+    pub_resp = client.get("/api/public/captures")
+    assert pub_resp.status_code == 200
+    matched = [c for c in pub_resp.json() if c["id"] == cid]
+    assert len(matched) == 1
+    assert matched[0]["id"] == cid
+
+
+def test_stage21_manual_capture_when_camera_disconnected(client_with_isolated_db):
+    """Verify POST /api/admin/camera/capture returns error when camera is disconnected."""
+    client, _ = client_with_isolated_db
+    login_resp = client.post("/api/admin/login", json={"password": settings.ADMIN_PASSWORD})
+    token = login_resp.json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {token}"}
+
+    # By default in test environment, physical COM9 camera is disconnected
+    capture_resp = client.post("/api/admin/camera/capture", headers=admin_headers)
+    assert capture_resp.status_code in (500, 503)
+    assert "disconnected" in capture_resp.json()["detail"].lower()
+
+

@@ -178,14 +178,12 @@ class VisionInferenceService:
 
         except Exception as exc:
             logger.exception(f"Inference error on {target_image}: {exc}")
-            # Fallback to copy image to predictions
-            pred_path = self._save_empty_annotation(target_image, capture_id)
             return {
                 "status": "error",
                 "error": str(exc),
                 "detections": [],
                 "inference_duration_ms": round((time.perf_counter() - start_time) * 1000.0, 2),
-                "prediction_image_path": str(pred_path),
+                "prediction_image_path": None,
                 "model_id": "waste_models_yolo",
             }
 
