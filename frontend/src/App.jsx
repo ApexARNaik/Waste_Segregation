@@ -111,15 +111,6 @@ function PublicDashboard({ navigate }) {
         <div className="metrics-grid">
           <div className="metric-card">
             <div className="metric-header">
-              <span>Approved Captures</span>
-              <CheckCircle size={18} color="var(--accent-emerald)" />
-            </div>
-            <div className="metric-value">{stats.approved_captures}</div>
-            <div className="metric-footer">Verified waste cycles</div>
-          </div>
-
-          <div className="metric-card">
-            <div className="metric-header">
               <span>Dry Waste</span>
               <span className="badge badge-dry">DRY</span>
             </div>
