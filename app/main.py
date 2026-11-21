@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.camera.serial_worker import camera_worker
 from app.config import settings
+from app.sensors.serial_service import sensor_service
 from app.database import (
     approve_capture,
     correct_detection_class,
@@ -45,10 +46,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     vision_service.load()
     # 4. Start camera serial worker background thread
     camera_worker.start()
+    # 5. Start sensor controller serial service background thread
+    sensor_service.start()
 
     yield
 
     # Shutdown
+    sensor_service.stop()
     camera_worker.stop()
 
 
@@ -163,6 +167,52 @@ class CorrectionRequest(BaseModel):
     note: Optional[str] = Field(None, description="Audit note for classification correction")
 
 
+class SensorData(BaseModel):
+    rain_analog: Optional[int] = Field(None, description="Raw ADC 12-bit value (0-4095)")
+    rain_digital: Optional[int] = Field(None, description="Digital state (0 or 1)")
+    ir_raw: Optional[int] = Field(None, description="Digital state (0 or 1)")
+    ir_detected: Optional[bool] = Field(None, description="Interpreted obstacle detected state")
+    inductive_raw: Optional[int] = Field(None, description="Digital state (0 or 1)")
+    metal_detected: Optional[bool] = Field(None, description="Interpreted metal detected state")
+
+
+class ActuatorData(BaseModel):
+    servo_angle: Optional[int] = Field(None, description="Current commanded angle (0-180)")
+    stepper_angle_estimated: Optional[int] = Field(None, description="Estimated accumulated rotation in degrees since boot")
+    stepper_speed_rpm: Optional[int] = Field(None, description="Configured speed in RPM (1-10)")
+    stepper_busy: Optional[bool] = Field(None, description="True if stepper is currently rotating")
+
+
+class LatestSensorsResponse(BaseModel):
+    connected: bool = Field(..., description="ESP32 DevKit connection state")
+    last_update: Optional[str] = Field(None, description="ISO-8601 timestamp of last telemetry received")
+    stale: bool = Field(..., description="Whether telemetry is stale or missing")
+    sensors: SensorData
+    actuators: ActuatorData
+
+
+class SensorStatusResponse(BaseModel):
+    connected: bool = Field(..., description="ESP32 DevKit connection status")
+    port: Optional[str] = Field(None, description="Configured serial COM port")
+    baud: int = Field(..., description="Serial baud rate")
+    last_update: Optional[str] = Field(None, description="Timestamp of last valid telemetry received")
+    stale: bool = Field(..., description="Stale telemetry flag")
+    last_error: Optional[str] = Field(None, description="Last connection or communication error")
+
+
+class ServoCommandRequest(BaseModel):
+    angle: int = Field(..., ge=0, le=180, description="Target angle in degrees (0 to 180)")
+
+
+class StepperCommandRequest(BaseModel):
+    angle: int = Field(..., ge=-360, le=360, description="Rotation angle in degrees (-360 to 360)")
+
+
+class StepperSpeedRequest(BaseModel):
+    rpm: int = Field(..., ge=1, le=10, description="Rotation speed in RPM (1 to 10)")
+
+
+
 # =====================================================================
 # Public Endpoints
 # =====================================================================
@@ -218,6 +268,20 @@ def get_public_approved_captures(
     """
     approved_items = list_public_captures(limit=limit, offset=offset)
     return [PublicCaptureItem(**item) for item in approved_items]
+
+
+@app.get("/api/sensors/latest", response_model=LatestSensorsResponse, tags=["Sensors"])
+def get_latest_sensors() -> LatestSensorsResponse:
+    """Return the latest real-time sensor readings and actuator statuses."""
+    data = sensor_service.get_latest()
+    return LatestSensorsResponse(**data)
+
+
+@app.get("/api/sensors/status", response_model=SensorStatusResponse, tags=["Sensors"])
+def get_sensors_status() -> SensorStatusResponse:
+    """Return ESP32 DevKit controller connectivity, COM port, baud rate, and error status."""
+    status_data = sensor_service.get_status()
+    return SensorStatusResponse(**status_data)
 
 
 @app.get("/api/public/images/{capture_id}", tags=["Public"])
@@ -467,6 +531,88 @@ def get_admin_capture_image(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image file not found on disk.")
 
     return FileResponse(path=file_path, media_type="image/jpeg")
+
+
+# =====================================================================
+# Actuator Control Endpoints (Require require_admin)
+# =====================================================================
+
+@app.post("/api/admin/actuators/servo", tags=["Actuators"])
+def set_servo_angle(
+    payload: ServoCommandRequest,
+    current_admin: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Admin command to set servo motor position (0-180 degrees)."""
+    if not sensor_service.is_connected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ESP32 DevKit sensor controller is offline or disconnected.",
+        )
+    try:
+        ack = sensor_service.send_command("SERVO", payload.angle)
+        if not ack.get("success", False):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ack.get("message", "Servo command rejected by controller"),
+            )
+        return ack
+    except (RuntimeError, TimeoutError) as err:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(err),
+        )
+
+
+@app.post("/api/admin/actuators/stepper", tags=["Actuators"])
+def rotate_stepper(
+    payload: StepperCommandRequest,
+    current_admin: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Admin command to rotate stepper motor by relative degrees (-360 to 360)."""
+    if not sensor_service.is_connected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ESP32 DevKit sensor controller is offline or disconnected.",
+        )
+    try:
+        ack = sensor_service.send_command("STEPPER", payload.angle)
+        if not ack.get("success", False):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ack.get("message", "Stepper command rejected by controller"),
+            )
+        return ack
+    except (RuntimeError, TimeoutError) as err:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(err),
+        )
+
+
+@app.post("/api/admin/actuators/stepper/speed", tags=["Actuators"])
+def set_stepper_speed(
+    payload: StepperSpeedRequest,
+    current_admin: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Admin command to configure stepper motor speed (1-10 RPM)."""
+    if not sensor_service.is_connected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ESP32 DevKit sensor controller is offline or disconnected.",
+        )
+    try:
+        ack = sensor_service.send_command("SPEED", payload.rpm)
+        if not ack.get("success", False):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ack.get("message", "Stepper speed command rejected by controller"),
+            )
+        return ack
+    except (RuntimeError, TimeoutError) as err:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(err),
+        )
 
 
 # =====================================================================

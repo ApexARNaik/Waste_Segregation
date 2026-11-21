@@ -62,6 +62,18 @@ class Settings:
         except ValueError:
             self.MODEL_CONFIDENCE = 0.25
 
+        # ESP32 DevKit Sensor & Actuator Controller configuration
+        self.SENSOR_CONTROLLER_PORT = os.getenv("SENSOR_CONTROLLER_PORT", "").strip()
+        try:
+            self.SENSOR_CONTROLLER_BAUD = int(os.getenv("SENSOR_CONTROLLER_BAUD", "115200"))
+        except ValueError:
+            self.SENSOR_CONTROLLER_BAUD = 115200
+
+        try:
+            self.SENSOR_TELEMETRY_STALE_SECONDS = float(os.getenv("SENSOR_TELEMETRY_STALE_SECONDS", "3.0"))
+        except ValueError:
+            self.SENSOR_TELEMETRY_STALE_SECONDS = 3.0
+
         self.RAW_IMAGES_DIR = self.BASE_DIR / "data" / "images" / "raw"
         self.PREDICTIONS_IMAGES_DIR = self.BASE_DIR / "data" / "images" / "predictions"
         self.FRONTEND_DIST_DIR = self.BASE_DIR / "frontend" / "dist"
